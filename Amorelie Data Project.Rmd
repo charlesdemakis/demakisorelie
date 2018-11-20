@@ -1,0 +1,384 @@
+---
+title: "Amorelie Data Project"
+author: "Charles Demakis"
+date: "November 18, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(forecast)
+library(hts)
+library(prophet)
+library(reshape2)
+library(tidyverse)
+library(timetk)
+library(xts)
+
+```
+
+I ultimately investigated how the data could be modeled using three different methods - hierarchical time series (HTS), ARIMA with external regressors (ARIMAX), and the Facebook-created open source Prophet package, which uses Bayesian general additive modeling (Prophet). Unfortunately, each of these approaches in R requires differently structured data as inputs, so I have to prepare the data multiple times. First, however, I recreate the simple merged dataset I used for exploratory data analysis, although I did not actually use any of the information included in the products.csv file in my ultimate analysis.
+
+```{r merged_data, message = F, warning = F}
+
+product_df <- read_csv('products.csv', col_names = T)
+product_df <- lapply(product_df, as.factor) %>% as.tibble()
+
+sales_df <- read_csv('sales.csv', col_names = T)
+sales_df[c(1,2)] <- lapply(sales_df[c(1,2)], as.factor)
+
+sales_df_merged <- merge(product_df, sales_df, by = 'product_id')
+
+```
+
+
+
+```{r hts_data, message = F, warning = F}
+
+sales_hts_ts <- sales_df_merged %>%
+  select(product_id, website, date, units_sold) %>%
+  
+  # The hts package requires that the hierarchical nesting be encoded in the characters of the columns; here the website is a level under the product
+  
+  unite('prod_web', product_id, website) %>%
+  spread(key = 'prod_web', value = 'units_sold') %>%
+  xts(x = .[,-1], order.by = .[,1]) %>%
+  
+  # For every method, I convert the daily data to weekly data to reduce noise and model complexity
+  
+  apply.weekly(function(x) apply(x, 2, sum)) %>%
+  
+  # The hts package works best with ts objects
+  
+  ts(frequency = 52, start = c(2015, 1))
+
+```
+
+
+
+```{r hts_analysis, message = F, warning = F}
+
+# This creates the basic hts model structure
+
+sales_hts <- hts(sales_hts_ts, characters = c(6,1))
+
+train_hts <- window(sales_hts, end = c(2018,5))
+test_hts <- window(sales_hts, start = c(2018,6))
+
+# I found during my exploratory analysis that using optimal reconciliation (method = 'comb') and wls weights gave the best results of the specifications I tried, measured by the number of models with lower RSME and MASE.
+
+pred_hts <- forecast(train_hts, h = 5, method = 'comb', weights = 'wls', fmethod = 'arima')
+
+# The model sometimes predicts negative values, which would not be possible, so I substitute zeroes for all these predictions
+
+pred_hts$bts[pred_hts$bts < 0] <- 0
+
+# Gets accuracy statistics
+
+pred_acc <- accuracy(pred_hts, test_hts, d=1, D=0)
+
+# For each appraoch, I create a table with its predictions for the last five weeks of the data provided in sales.csv and several accuracy statistics that indicate its performance
+
+hts_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
+                                
+names(hts_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+
+pred_hts_mid <- aggts(pred_hts, levels = 1, forecast = T)
+hts_results[,1] <- colnames(pred_hts_mid) %>%
+  as.vector() %>%
+  sub('_', '', .)
+hts_results[,2:6] <- t(pred_hts_mid)
+hts_results[,7:9] <- pred_acc[c(2,3,6),2:18] %>% t() 
+
+```
+
+
+
+```{r arimax_prophet_data, message = F, warning = F}
+
+sales_df <- read_csv('sales.csv', col_names = T)
+sales_df[c(1,2)] <- lapply(sales_df[c(1,2)], as.factor)
+
+# I convert the promotion dummies to numeric binary values
+
+sales_df <- sales_df %>%
+  mutate(prom1 = ifelse(promotion_dummy_1 == 'Yes', 1, 0),
+         prom2 = ifelse(promotion_dummy_2 == 'Yes', 1, 0)) %>%
+  select(-promotion_dummy_1, - promotion_dummy_2)
+
+# I want to reduce the number of features, so I weight the promotional dummy value conditional on which website/market it is in and so they can later be summed across websites and used as a single feature per promotion
+
+sales_total <- sum(sales_df$units_sold)
+
+sales_sites <- sales_df %>% 
+  group_by(website) %>% 
+  summarise(units_sold = sum(units_sold))
+
+share_sales <- unlist(sales_sites[,2]/sales_total)
+
+for (i in 1:3) {
+  
+  sales_df$prom1[sales_df$website == i] <- sales_df$prom1[sales_df$website == i] * share_sales[i]
+  sales_df$prom2[sales_df$website == i] <- sales_df$prom2[sales_df$website == i] * share_sales[i]
+  
+}
+
+
+# For the ARIMAX and Prophet models, I model sales for all websites combined, but I keep the price for each market as a separate regressor/feature in the model
+
+sales_spread <- sales_df %>%
+  select(product_id, website, date, selling_price) %>%
+  spread(key = 'website', value = 'selling_price')
+
+names(sales_spread)[3:5] <- c('price_1', 'price_2', 'price_3')
+
+sales_df <- sales_df %>%
+  select(-selling_price, - website) %>%
+  group_by(product_id, date) %>%
+  summarise_all(sum, na.rm = T) %>%
+  merge(sales_spread, by = c('product_id', 'date'))
+
+
+```
+
+
+
+```{r arimax_analysis, message = F, warning = F}
+
+# The products cover various periods of time and have different rank regressor matrices, so I found it easier to create a for-loop that fits a model to each product and then creates a forecast rather than finding a way to do this all with the map or apply functionalities
+
+product_vector <- levels(sales_df$product_id)
+
+# This helps set the starting point for each product's ts object
+
+start_times <- sales_df %>%
+  select(product_id, date) %>%
+  group_by(product_id) %>%
+  summarise(date = min(date)) %>% 
+  .[,2] %>%
+  unlist() %>%
+  as.Date()
+
+arimax_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
+
+names(arimax_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+
+for (i in 1:length(product_vector)) {
+
+# This first part again converts the data to a ts object that has been aggregated by week
+    
+  sales_ts <- sales_df %>%
+    filter(product_id == product_vector[i]) %>%
+    select(-product_id) %>%
+    group_by(date = cut(date, breaks = "week")) %>%
+    summarise_all(mean, na.rm = T) %>%
+    mutate(units_sold = units_sold * 7) %>%
+    ts(frequency = 52, 
+       start = c(as.numeric(format(start_times[i], format = "%Y")), 
+                 as.numeric(format(start_times[i], format = "%W")))) %>%
+    .[,-1]
+
+# This ensures the regression matrix is rank definite
+      
+  sales_ts[is.na(sales_ts)] <- 0
+  sales_ts <- sales_ts[, lapply(sales_ts, function(x) length(unique(x))) > 1]
+  
+  train_ts <- sales_ts[,1] %>% window(end = c(2018,4))
+  test_ts <- sales_ts[,1] %>% window(start = c(2018,5))
+  train_xreg <- sales_ts[1:(dim(sales_ts)[1]-5),-1]
+  test_xreg <- sales_ts[(dim(sales_ts)[1]-4):dim(sales_ts)[1],-1]
+  
+  sales_m <- auto.arima(train_ts, xreg = train_xreg)
+  
+  sales_f <- forecast(sales_m, h = 5, xreg = test_xreg)
+  
+  sales_f$mean[sales_f$mean < 0] <- 0
+  
+  sales_acc <- accuracy(sales_f, test_ts, xreg = test_xreg, d=1, D=0)
+  
+  arimax_results[i,1] <- product_vector[i]
+  arimax_results[i,2:6] <- sales_f$mean
+  arimax_results[i,7:9] <- sales_acc[2,c(2,3,6)]
+  
+}
+
+
+
+```
+
+```{r prophet_analysis, message = F, warning = F}
+
+sales_df_pr <- sales_df %>%
+  rename(ds = date, y = units_sold) %>%
+  
+  # Prophet works best with high frequency/daily data, but it does not work particularly well with intermittent demand and low volume, so again I aggregate by website and week
+  
+  group_by(product_id, ds = cut(ds, breaks = "week")) %>%
+  summarise_all(mean, na.rm = T) %>%
+  
+  # The floor is to add a logistic dampening to Prophet to prevent the model from predicting too many negative values; the cap is because Prophet requires you to have a cap if you want a floor; I chose an arbitrarily high value since it does not seem like the model will be overpredicting demand growth
+  
+  mutate(ds = as.Date(ds),
+         y = y * 7,
+         cap = 1000, 
+         floor = 0) %>%
+  mutate_if(is.numeric , replace_na, replace = 0) 
+
+sales_df_pr_train <- sales_df_pr %>%
+  do(head(., n=(dim(.)[1]-5))) %>%
+  nest()
+names(sales_df_pr_train)[2] <- 'train'
+
+
+sales_df_pr_test <- sales_df_pr %>%
+  do(tail(., n=5)) %>%
+  nest()
+names(sales_df_pr_test)[2] <- 'test'
+
+sales_df_pr <- merge(sales_df_pr_train, sales_df_pr_test, by = 'product_id')
+
+# If I had more time, I would work with and try to optimize the seasonality parameters more, but intuitively there should be only yearly seasonality and Prophet is able to detect and set an appropriate number of Fourier terms
+
+sales_pmodel <- prophet(growth = 'logistic', yearly.seasonality = T)
+sales_pmodel <- add_regressor(sales_pmodel, 'price_1')
+sales_pmodel <- add_regressor(sales_pmodel, 'price_2')
+sales_pmodel <- add_regressor(sales_pmodel, 'price_3')
+sales_pmodel <- add_regressor(sales_pmodel, 'prom1')
+sales_pmodel <- add_regressor(sales_pmodel, 'prom2')
+
+sales_df_pr_f <- sales_df_pr %>%
+  mutate(model = map(train, fit.prophet, m = sales_pmodel)) %>%
+  mutate(forecast = map2(model, test, predict)) %>%
+  unnest(forecast) %>%
+  select(product_id, ds, yhat)
+
+sales_df_pr_f$yhat[sales_df_pr_f$yhat < 0] <- 0
+
+prophet_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
+                                
+names(prophet_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+
+# Prophet comes with its own elaborate set of evaluation functions and accuracy metrics, but using them requires more time: more time from me, to see how best to use them, and more computing time, as they are computationally involved
+
+pr_error <- sales_df_pr_test %>%
+  unnest(test) %>%
+  select(product_id, ds, y) %>%
+  merge(sales_df_pr_f, by = c('product_id', 'ds')) %>%
+  mutate(res = (y-yhat)) %>%
+  group_by(product_id) %>%
+  summarise(rmse = (mean(res^2))^0.5,
+            mae = mean(abs(res))) 
+
+pr_spread <- sales_df_pr_f %>%
+  spread(key = 'ds', value = 'yhat')
+
+prophet_results[,1:6] <- pr_spread
+prophet_results[,7:8] <- pr_error[,2:3]
+prophet_results[,9] <- prophet_results[,8] * arimax_results$mase/arimax_results$mae
+
+
+```
+
+```{r evaluation, message = F, warning = F}
+
+# I am only evaluating over a short training horizon to get a feel for general performance, I would spend more time running multiple CVs (say, 5 or 10 with a five-week rolling window) to more properly evaluate them.
+
+mase_df <-cbind(c(mean(hts_results$mase),
+                  mean(arimax_results$mase),
+                  mean(prophet_results$mase)),
+                c(median(hts_results$mase),
+                  median(arimax_results$mase),
+                  median(prophet_results$mase)),
+                c(var(hts_results$mase),
+                  var(arimax_results$mase),
+                  var(prophet_results$mase)))
+rownames(mase_df) <- c('hts', 'arimax', 'prophet')
+colnames(mase_df) <- c('mean', 'median', 'variance')
+
+
+best_rmse <- pmin(hts_results$rmse, arimax_results$rmse, prophet_results$rmse)
+sum(hts_results$rmse == best_rmse)
+sum(arimax_results$rmse == best_rmse)
+sum(prophet_results$rmse == best_rmse)
+
+best_mase <- pmin(hts_results$mase, arimax_results$mase, prophet_results$mase)
+sum(hts_results$mase == best_mase)
+sum(arimax_results$mase == best_mase)
+sum(prophet_results$mase == best_mase)
+
+
+```
+
+
+
+```{r sales_histogram, message = F, warning = F}
+
+sales_histogram <- ggplot(data = sales_df_merged, 
+                          aes(x = units_sold)) +
+  geom_histogram(binwidth = 1, fill = 'dodgerblue') +
+  scale_x_continuous(limits = c(0,50)) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(plot.title = element_text(size = rel(1.2)),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(hjust = 0.45, face = "bold", size = 10.5),
+        strip.background = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(title = "Frequency of Daily Units Sold per SKU",
+       x = "Units Sold",
+       y = "Frequency")
+
+```
+
+
+
+```{r forecast_graph, message = F, warning = F}
+
+sales_ts <- sales_df %>%
+  filter(product_id == product_vector[1]) %>%
+  select(-product_id) %>%
+  group_by(date = cut(date, breaks = "week")) %>%
+  summarise_all(mean, na.rm = T) %>%
+  mutate(units_sold = units_sold * 7) %>%
+  ts(frequency = 52, 
+     start = c(as.numeric(format(start_times[1], format = "%Y")), 
+               as.numeric(format(start_times[1], format = "%W")))) %>%
+  .[,-1]
+
+sales_ts[is.na(sales_ts)] <- 0
+sales_ts <- sales_ts[, lapply(sales_ts, function(x) length(unique(x))) > 1]
+
+train_ts <- sales_ts[,1] %>% window(end = c(2017,52))
+test_ts <- sales_ts[,1] %>% window(start = c(2018,1))
+train_xreg <- sales_ts[1:(dim(sales_ts)[1]-9),-1]
+test_xreg <- sales_ts[(dim(sales_ts)[1]-9):dim(sales_ts)[1],-1]
+test_plot <- sales_ts
+
+sales_m <- auto.arima(train_ts, xreg = train_xreg)
+
+sales_f <- forecast(sales_m, h = 9, xreg = test_xreg)
+
+test_plot <- cbind(as.numeric(time(test_ts)), test_ts) %>% as.data.frame()
+names(test_plot) <- c('t', 'units')
+
+forecast_graph <- autoplot(sales_f) +
+  geom_point(data = test_plot, aes(x = t, y = units)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = rel(1.2)),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(hjust = 0.45, face = "bold", size = 10.5),
+        strip.background = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(title = "Sales and Forecast for Product ID 14530 with ARIMAX",
+       x = "",
+       y = "Weekly Units Sold")
+
+```
+
+
+
+
