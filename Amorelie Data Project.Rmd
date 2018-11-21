@@ -1,7 +1,7 @@
 ---
 title: "Amorelie Data Project"
 author: "Charles Demakis"
-date: "November 18, 2018"
+date: "November 20, 2018"
 output: html_document
 ---
 
@@ -17,7 +17,7 @@ library(xts)
 
 ```
 
-I ultimately investigated how the data could be modeled using three different methods - hierarchical time series (HTS), ARIMA with external regressors (ARIMAX), and the Facebook-created open source Prophet package, which uses Bayesian general additive modeling (Prophet). Unfortunately, each of these approaches in R requires differently structured data as inputs, so I have to prepare the data multiple times. First, however, I recreate the simple merged dataset I used for exploratory data analysis, although I did not actually use any of the information included in the products.csv file in my ultimate analysis.
+I ultimately investigated how the data could be modeled using three different methods - hierarchical time series (HTS), ARIMA with external regressors (ARIMAX), and the Facebook-created open source Prophet package, which uses Bayesian general additive modeling (Prophet). Unfortunately, each of these approaches in R requires differently structured data as inputs, so I have to prepare the data multiple times. First, however, I recreate the simple merged dataset I used for exploratory data analysis, although I did not actually use any of the information included in the products.csv file in my final analysis.
 
 ```{r merged_data, message = F, warning = F}
 
@@ -78,6 +78,8 @@ pred_hts$bts[pred_hts$bts < 0] <- 0
 pred_acc <- accuracy(pred_hts, test_hts, d=1, D=0)
 
 # For each appraoch, I create a table with its predictions for the last five weeks of the data provided in sales.csv and several accuracy statistics that indicate its performance
+
+product_vector <- levels(sales_df$product_id)
 
 hts_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
                                 
@@ -147,10 +149,6 @@ sales_df <- sales_df %>%
 
 # The products cover various periods of time and have different rank regressor matrices, so I found it easier to create a for-loop that fits a model to each product and then creates a forecast rather than finding a way to do this all with the map or apply functionalities
 
-product_vector <- levels(sales_df$product_id)
-
-# This helps set the starting point for each product's ts object
-
 start_times <- sales_df %>%
   select(product_id, date) %>%
   group_by(product_id) %>%
@@ -206,6 +204,8 @@ for (i in 1:length(product_vector)) {
 
 ```
 
+
+
 ```{r prophet_analysis, message = F, warning = F}
 
 sales_df_pr <- sales_df %>%
@@ -239,7 +239,8 @@ sales_df_pr <- merge(sales_df_pr_train, sales_df_pr_test, by = 'product_id')
 
 # If I had more time, I would work with and try to optimize the seasonality parameters more, but intuitively there should be only yearly seasonality and Prophet is able to detect and set an appropriate number of Fourier terms
 
-sales_pmodel <- prophet(growth = 'logistic', yearly.seasonality = T)
+sales_pmodel <- prophet(growth = 'logistic', 
+                        yearly.seasonality = T)
 sales_pmodel <- add_regressor(sales_pmodel, 'price_1')
 sales_pmodel <- add_regressor(sales_pmodel, 'price_2')
 sales_pmodel <- add_regressor(sales_pmodel, 'price_3')
@@ -279,6 +280,8 @@ prophet_results[,9] <- prophet_results[,8] * arimax_results$mase/arimax_results$
 
 ```
 
+
+
 ```{r evaluation, message = F, warning = F}
 
 # I am only evaluating over a short training horizon to get a feel for general performance, I would spend more time running multiple CVs (say, 5 or 10 with a five-week rolling window) to more properly evaluate them.
@@ -305,7 +308,6 @@ best_mase <- pmin(hts_results$mase, arimax_results$mase, prophet_results$mase)
 sum(hts_results$mase == best_mase)
 sum(arimax_results$mase == best_mase)
 sum(prophet_results$mase == best_mase)
-
 
 ```
 
