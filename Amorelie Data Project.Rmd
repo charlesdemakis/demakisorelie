@@ -17,7 +17,12 @@ library(xts)
 
 ```
 
-I ultimately investigated how the data could be modeled using three different methods - hierarchical time series (HTS), ARIMA with external regressors (ARIMAX), and the Facebook-created open source Prophet package, which uses Bayesian general additive modeling (Prophet). Unfortunately, each of these approaches in R requires differently structured data as inputs, so I have to prepare the data multiple times. First, however, I recreate the simple merged dataset I used for exploratory data analysis, although I did not actually use any of the information included in the products.csv file in my final analysis.
+I ultimately investigated how the data could be modeled using three different methods - hierarchical time series (HTS), 
+ARIMA with external regressors (ARIMAX), and the Facebook-created open source Prophet package, 
+which uses Bayesian general additive modeling (Prophet). Unfortunately, each of these approaches in R requires
+differently structured data as inputs, so I have to prepare the data multiple times. First, however, I recreate 
+the simple merged dataset I used for exploratory data analysis,
+although I did not actually use any of the information included in the products.csv file in my final analysis.
 
 ```{r merged_data, message = F, warning = F}
 
@@ -38,7 +43,8 @@ sales_df_merged <- merge(product_df, sales_df, by = 'product_id')
 sales_hts_ts <- sales_df_merged %>%
   select(product_id, website, date, units_sold) %>%
   
-  # The hts package requires that the hierarchical nesting be encoded in the characters of the columns; here the website is a level under the product
+  # The hts package requires that the hierarchical nesting be encoded in the characters of the columns; 
+  # here the website is a level under the product
   
   unite('prod_web', product_id, website) %>%
   spread(key = 'prod_web', value = 'units_sold') %>%
@@ -65,9 +71,14 @@ sales_hts <- hts(sales_hts_ts, characters = c(6,1))
 train_hts <- window(sales_hts, end = c(2018,5))
 test_hts <- window(sales_hts, start = c(2018,6))
 
-# I found during my exploratory analysis that using optimal reconciliation (method = 'comb') and wls weights gave the best results of the specifications I tried, measured by the number of models with lower RSME and MASE.
+# I found during my exploratory analysis that using optimal reconciliation (method = 'comb') and wls weights gave 
+# the best results of the specifications I tried, measured by the number of models with lower RSME and MASE.
 
-pred_hts <- forecast(train_hts, h = 5, method = 'comb', weights = 'wls', fmethod = 'arima')
+pred_hts <- forecast(train_hts, 
+                     h = 5, 
+                     method = 'comb', 
+                     weights = 'wls', 
+                     fmethod = 'arima')
 
 # The model sometimes predicts negative values, which would not be possible, so I substitute zeroes for all these predictions
 
@@ -77,13 +88,24 @@ pred_hts$bts[pred_hts$bts < 0] <- 0
 
 pred_acc <- accuracy(pred_hts, test_hts, d=1, D=0)
 
-# For each appraoch, I create a table with its predictions for the last five weeks of the data provided in sales.csv and several accuracy statistics that indicate its performance
+# For each appraoch, I create a table with its predictions for the last five weeks of the data provided in sales.csv and
+# several accuracy statistics that indicate its performance
 
 product_vector <- levels(sales_df$product_id)
 
 hts_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
-                                
-names(hts_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+
+results_names <- c('product_id', 
+                    'week_1_sales', 
+                    'week_2_sales', 
+                    'week_3_sales', 
+                    'week_4_sales', 
+                    'week_5_sales', 
+                    'rmse', 
+                    'mae', 
+                    'mase')
+
+names(hts_results) <- results_names
 
 pred_hts_mid <- aggts(pred_hts, levels = 1, forecast = T)
 hts_results[,1] <- colnames(pred_hts_mid) %>%
@@ -108,7 +130,8 @@ sales_df <- sales_df %>%
          prom2 = ifelse(promotion_dummy_2 == 'Yes', 1, 0)) %>%
   select(-promotion_dummy_1, - promotion_dummy_2)
 
-# I want to reduce the number of features, so I weight the promotional dummy value conditional on which website/market it is in and so they can later be summed across websites and used as a single feature per promotion
+# I want to reduce the number of features, so I weight the promotional dummy value conditional on which website/market 
+# it is in and so they can later be summed across websites and used as a single feature per promotion
 
 sales_total <- sum(sales_df$units_sold)
 
@@ -126,7 +149,8 @@ for (i in 1:3) {
 }
 
 
-# For the ARIMAX and Prophet models, I model sales for all websites combined, but I keep the price for each market as a separate regressor/feature in the model
+# For the ARIMAX and Prophet models, I model sales for all websites combined, but I keep the price for each market 
+# as a separate regressor/feature in the model
 
 sales_spread <- sales_df %>%
   select(product_id, website, date, selling_price) %>%
@@ -147,7 +171,9 @@ sales_df <- sales_df %>%
 
 ```{r arimax_analysis, message = F, warning = F}
 
-# The products cover various periods of time and have different rank regressor matrices, so I found it easier to create a for-loop that fits a model to each product and then creates a forecast rather than finding a way to do this all with the map or apply functionalities
+# The products cover various periods of time and have different rank regressor matrices, so I found it easier to create 
+# a for-loop that fits a model to each product and then creates a forecast rather than finding a way to do this all 
+# with the map or apply functionalities
 
 start_times <- sales_df %>%
   select(product_id, date) %>%
@@ -159,7 +185,7 @@ start_times <- sales_df %>%
 
 arimax_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
 
-names(arimax_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+names(arimax_results) <- results_names
 
 for (i in 1:length(product_vector)) {
 
@@ -211,12 +237,15 @@ for (i in 1:length(product_vector)) {
 sales_df_pr <- sales_df %>%
   rename(ds = date, y = units_sold) %>%
   
-  # Prophet works best with high frequency/daily data, but it does not work particularly well with intermittent demand and low volume, so again I aggregate by website and week
+  # Prophet works best with high frequency/daily data, but it does not work particularly well with intermittent demand 
+  # and low volume, so again I aggregate by website and week
   
   group_by(product_id, ds = cut(ds, breaks = "week")) %>%
   summarise_all(mean, na.rm = T) %>%
   
-  # The floor is to add a logistic dampening to Prophet to prevent the model from predicting too many negative values; the cap is because Prophet requires you to have a cap if you want a floor; I chose an arbitrarily high value since it does not seem like the model will be overpredicting demand growth
+  # The floor is to add a logistic dampening to Prophet to prevent the model from predicting too many negative values; 
+  # the cap is because Prophet requires you to have a cap if you want a floor; I chose an arbitrarily high value 
+  # since it does not seem like the model will be overpredicting demand growth
   
   mutate(ds = as.Date(ds),
          y = y * 7,
@@ -237,7 +266,8 @@ names(sales_df_pr_test)[2] <- 'test'
 
 sales_df_pr <- merge(sales_df_pr_train, sales_df_pr_test, by = 'product_id')
 
-# If I had more time, I would work with and try to optimize the seasonality parameters more, but intuitively there should be only yearly seasonality and Prophet is able to detect and set an appropriate number of Fourier terms
+# If I had more time, I would work with and try to optimize the seasonality parameters more, but intuitively there 
+# should be only yearly seasonality and Prophet is able to detect and set an appropriate number of Fourier terms
 
 sales_pmodel <- prophet(growth = 'logistic', 
                         yearly.seasonality = T)
@@ -257,9 +287,10 @@ sales_df_pr_f$yhat[sales_df_pr_f$yhat < 0] <- 0
 
 prophet_results <- data.frame(matrix(, nrow=length(product_vector), ncol = 9))
                                 
-names(prophet_results) <- c('product_id', 'week_1_sales', 'week_2_sales', 'week_3_sales', 'week_4_sales', 'week_5_sales', 'rmse', 'mae', 'mase')
+names(prophet_results) <- results_names
 
-# Prophet comes with its own elaborate set of evaluation functions and accuracy metrics, but using them requires more time: more time from me, to see how best to use them, and more computing time, as they are computationally involved
+# Prophet comes with its own elaborate set of evaluation functions and accuracy metrics, but using them requires 
+# more time: more time from me, to see how best to use them, and more computing time, as they are computationally involved
 
 pr_error <- sales_df_pr_test %>%
   unnest(test) %>%
@@ -284,7 +315,8 @@ prophet_results[,9] <- prophet_results[,8] * arimax_results$mase/arimax_results$
 
 ```{r evaluation, message = F, warning = F}
 
-# I am only evaluating over a short training horizon to get a feel for general performance, I would spend more time running multiple CVs (say, 5 or 10 with a five-week rolling window) to more properly evaluate them.
+# I am only evaluating over a short training horizon to get a feel for general performance, I would spend more time 
+# running multiple CVs (say, 5 or 10 with a five-week rolling window) to more properly evaluate them.
 
 mase_df <-cbind(c(mean(hts_results$mase),
                   mean(arimax_results$mase),
@@ -298,6 +330,9 @@ mase_df <-cbind(c(mean(hts_results$mase),
 rownames(mase_df) <- c('hts', 'arimax', 'prophet')
 colnames(mase_df) <- c('mean', 'median', 'variance')
 
+
+# There are several SKUs where the models perform quite poorly, and with more time it may be possible to find a way to
+# identify these and create an algorithm that fits them with a simpler model to prevent overfitting and improve predictive performance
 
 best_rmse <- pmin(hts_results$rmse, arimax_results$rmse, prophet_results$rmse)
 sum(hts_results$rmse == best_rmse)
